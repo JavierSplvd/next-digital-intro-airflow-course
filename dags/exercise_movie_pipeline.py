@@ -7,8 +7,8 @@ Usa la API gratuita de OMDb (https://www.omdbapi.com/) para buscar películas.
 ### Instrucciones
 
 1. Obtén una API key gratuita en: https://www.omdbapi.com/apikey.aspx
-2. Reemplaza "TU_API_KEY" por tu key real.
-3. Completa las funciones marcadas con TODO.
+2. Copia `.env.example` a `.env` y pon tu key en `OMDB_API_KEY`.
+3. Revisa las funciones para entender el flujo.
 4. Ejecuta el DAG y verifica que funciona en la UI de Airflow.
 
 ### Flujo del pipeline:
@@ -33,17 +33,32 @@ Usa la API gratuita de OMDb (https://www.omdbapi.com/) para buscar películas.
 """
 
 import logging
+import os
+from pathlib import Path
 
 import requests
 from airflow.sdk import dag, task
+from dotenv import load_dotenv
 from pendulum import datetime, duration
 
 # --------------- #
 # DAG Constants   #
 # --------------- #
 
+# Carga el .env de la raíz del proyecto (dags/ -> raíz).
+# En Astro CLI el .env ya se inyecta como variable de entorno en el
+# contenedor, así que aquí solo se usa cuando ejecutas fuera de él.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 OMDB_API_URL = "https://www.omdbapi.com/"
-OMDB_API_KEY = "TU_API_KEY"  # ⚠️ Reemplaza con tu API key gratuita
+OMDB_API_KEY = os.getenv("OMDB_API_KEY")
+
+if not OMDB_API_KEY:
+    raise ValueError(
+        "Falta la variable de entorno OMDB_API_KEY. "
+        "Copia .env.example a .env y pon tu API key de OMDb."
+    )
+
 HTTP_TIMEOUT_SECONDS = 15
 
 # Lista de películas a buscar
@@ -60,6 +75,18 @@ MOVIES_TO_SEARCH: list[str] = [
 ]
 
 log = logging.getLogger(__name__)
+
+
+def _to_float(value) -> float:
+    """Convierte un valor de la API a float.
+
+    OMDb devuelve "N/A" (string) cuando un dato no existe, por ejemplo en
+    películas sin puntuación registrada. En ese caso devolvemos 0.0.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # --------------- #
@@ -88,7 +115,7 @@ def exercise_movie_pipeline():
         """
         Busca información de cada película en la API de OMDb.
 
-        TODO 1: Completa la llamada a la API.
+        Llama a la API de OMDb para cada título.
         - Usa requests.get() con los parámetros: t=titulo, apikey=OMDB_API_KEY
         - Verifica que la respuesta sea exitosa con response.raise_for_status()
         - Añade el JSON de la respuesta a la lista de resultados
@@ -99,11 +126,40 @@ def exercise_movie_pipeline():
         movie_results: list[dict] = []
 
         for movie_title in MOVIES_TO_SEARCH:
-            # TODO 1: Haz la llamada a la API aquí
-            # response = requests.get(...)
-            # movie_data = response.json()
-            # movie_results.append(movie_data)
-            pass
+            # Usamos params= para que requests codifique títulos con espacios
+            # o acentos (ej. "Dune: Part Two") de forma segura en la URL.
+            response = requests.get(
+                OMDB_API_URL,
+                params={"t": movie_title, "apikey": OMDB_API_KEY},
+                timeout=HTTP_TIMEOUT_SECONDS,
+            )
+            # Lanza una excepción si la API responde 4xx/5xx (ej. key inválida).
+            response.raise_for_status()
+            movie_data = response.json()
+
+            # OMDb responde 200 con {"Response": "False"} cuando no encuentra
+            # la película (títulos en español o con otro nombre oficial).
+            if movie_data.get("Response") == "False":
+                log.warning(
+                    "No se encontró %r: %s",
+                    movie_title,
+                    movie_data.get("Error", "error desconocido"),
+                )
+                continue
+
+            log.info(
+                "Película encontrada: %s (%s)",
+                movie_data.get("Title"),
+                movie_data.get("Year"),
+            )
+            movie_results.append(movie_data)
+
+        if not movie_results:
+            # Fallar explícitamente: si no, el DAG terminaría en verde sin
+            # haber hecho nada y sería difícil detectar el problema.
+            raise ValueError(
+                "No se obtuvo ninguna película. Revisa la API key y los títulos."
+            )
 
         log.info("Se obtuvieron %d películas.", len(movie_results))
         return movie_results
@@ -113,7 +169,7 @@ def exercise_movie_pipeline():
         """
         Transforma los datos crudos de la API en un formato limpio.
 
-        TODO 2: Extrae los campos relevantes de cada película.
+        Extrae los campos relevantes de cada película.
         Para cada película en raw_movies, crea un diccionario con:
         - "title": título (campo "Title" de la API)
         - "year": año (campo "Year")
@@ -126,13 +182,18 @@ def exercise_movie_pipeline():
         clean_movies: list[dict] = []
 
         for movie in raw_movies:
-            # TODO 2: Transforma cada película aquí
-            # clean_movie = {
-            #     "title": movie.get("Title", "Desconocido"),
-            #     ...
-            # }
-            # clean_movies.append(clean_movie)
-            pass
+            # .get() con default evita KeyError si la API omite un campo;
+            # _to_float() evita el ValueError cuando imdbRating es "N/A".
+            clean_movie = {
+                "title": movie.get("Title") or "Desconocido",
+                "year": movie.get("Year") or "Desconocido",
+                "director": movie.get("Director") or "Desconocido",
+                "rating_imdb": _to_float(movie.get("imdbRating")),
+                "genre": movie.get("Genre") or "Desconocido",
+                "plot": movie.get("Plot") or "Sin sinopsis",
+            }
+            clean_movies.append(clean_movie)
+            log.info("Transformada: %s", clean_movie["title"])
 
         log.info("Se transformaron %d películas.", len(clean_movies))
         return clean_movies
@@ -142,7 +203,7 @@ def exercise_movie_pipeline():
         """
         Muestra los resultados del análisis.
 
-        TODO 3: Implementa la lógica para mostrar:
+        Muestra:
         - Un listado de todas las películas con su rating
         - La película con mejor puntuación IMDb
         - El promedio de puntuación de todas las películas
@@ -153,13 +214,40 @@ def exercise_movie_pipeline():
             log.warning("No hay películas para mostrar.")
             return
 
-        # TODO 3: Muestra los resultados aquí
-        # for movie in movies:
-        #     log.info(...)
-        #
-        # best_movie = max(movies, key=lambda m: m.get("rating_imdb", 0))
-        # log.info("Mejor película: %s", best_movie.get("title"))
-        pass
+        # 1) Listado de todas las películas con su rating.
+        for movie in movies:
+            rating = movie.get("rating_imdb", 0.0)
+            rating_text = f"{rating:.1f}" if rating > 0 else "sin puntuación"
+            log.info(
+                "%s (%s) - IMDb: %s",
+                movie.get("title", "Desconocido"),
+                movie.get("year", "Desconocido"),
+                rating_text,
+            )
+
+        # 2) Mejor puntuación y promedio. Excluimos los 0.0 (películas sin
+        # rating) para que no distorsionen el promedio.
+        rated_movies = [m for m in movies if m.get("rating_imdb", 0.0) > 0]
+
+        if not rated_movies:
+            log.warning("Ninguna película tiene puntuación IMDb válida.")
+            return
+
+        best_movie = max(rated_movies, key=lambda m: m.get("rating_imdb", 0.0))
+        log.info(
+            "Mejor película: %s con %.1f",
+            best_movie.get("title", "Desconocido"),
+            best_movie.get("rating_imdb", 0.0),
+        )
+
+        average_rating = sum(m.get("rating_imdb", 0.0) for m in rated_movies) / len(
+            rated_movies
+        )
+        log.info(
+            "Promedio de puntuación (%d películas con rating): %.2f",
+            len(rated_movies),
+            average_rating,
+        )
 
     # --- Dependencias ---
     # Con TaskFlow API (@task), las dependencias se crean automáticamente
