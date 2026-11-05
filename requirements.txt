@@ -1,3 +1,4 @@
 # Add Python packages here, one per line. Pin versions where possible.
 apache-airflow-providers-amazon
 matplotlib
+python-dotenv
